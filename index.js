@@ -1,13 +1,10 @@
 // index.js
 const { Client, GatewayIntentBits, Events, ActivityType, EmbedBuilder } = require('discord.js');
-const fs = require('fs');
-const path = require('path');
+const { pool, initDB } = require('./db');
 require('dotenv').config();
 
 // --- 設定 ---
-const DB_FILE = 'user_times.json';
-const DB_PATH = path.join(__dirname, DB_FILE);
-const SAVE_INTERVAL = 60 * 1000; // 1分
+const STATUS_UPDATE_INTERVAL = 60 * 1000; // 1分
 
 const client = new Client({
     intents: [
@@ -19,55 +16,41 @@ const client = new Client({
 
 let userTimes = new Map();
 
-// --- データ永続化のための関数 ---
+// --- データ永続化のための関数 (PostgreSQL版) ---
 
-function loadData() {
+async function loadData() {
     try {
-        if (fs.existsSync(DB_PATH)) {
-            const data = fs.readFileSync(DB_PATH, 'utf8');
-            const parsedData = JSON.parse(data);
-            userTimes = new Map(Object.entries(parsedData));
-            for (const userData of userTimes.values()) {
-                userData.joinTime = null;
-            }
-            console.log(`${DB_FILE} からデータを正常に読み込みました。`);
-        } else {
-            console.log(`${DB_FILE} が見つかりません。新しいデータファイルを作成します。`);
+        const { rows } = await pool.query('SELECT user_id, total_time FROM user_times');
+        for (const row of rows) {
+            userTimes.set(row.user_id, { totalTime: parseInt(row.total_time, 10), joinTime: null });
         }
+        console.log('データベースからデータを正常に読み込みました。');
     } catch (error) {
-        console.error(`${DB_FILE} の読み込み中にエラーが発生しました:`, error);
+        console.error('データベースの読み込み中にエラーが発生しました:', error);
     }
 }
 
-function saveData() {
+async function updateUserTime(userId, sessionTime) {
     try {
-        const dataToSave = new Map();
-        for (const [userId, data] of userTimes.entries()) {
-            let currentTotalTime = data.totalTime;
-            if (data.joinTime) {
-                currentTotalTime += Date.now() - data.joinTime;
-            }
-            dataToSave.set(userId, { totalTime: currentTotalTime, joinTime: null });
-        }
-        
-        const dataObject = Object.fromEntries(dataToSave);
-        // fs.writeFileSync を使用して同期的に書き込み、クラッシュ直前のデータ損失を防ぐ
-        fs.writeFileSync(DB_PATH, JSON.stringify(dataObject, null, 2));
-        // console.log(`データを ${DB_FILE} に保存しました。`); // 頻繁に呼ばれるのでログはコメントアウトしても良い
+        const query = `
+            INSERT INTO user_times (user_id, total_time)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id)
+            DO UPDATE SET total_time = user_times.total_time + $2;
+        `;
+        await pool.query(query, [userId, sessionTime]);
     } catch (error) {
-        console.error(`${DB_FILE} への保存中にエラーが発生しました:`, error);
+        console.error(`ユーザー時間の更新中にエラーが発生しました (ユーザーID: ${userId}):`, error);
     }
 }
 
 // --- Botのイベントリスナー ---
 
-client.once(Events.ClientReady, () => {
+client.once(Events.ClientReady, async () => {
     console.log(`ログインしました: ${client.user.tag}`);
-    loadData();
-    setInterval(() => {
-        updateStatus();
-        saveData(); // 長時間接続しているユーザーのデータを定期的にバックアップ
-    }, SAVE_INTERVAL);
+    await initDB();
+    await loadData();
+    setInterval(updateStatus, STATUS_UPDATE_INTERVAL);
     updateStatus();
 });
 
@@ -88,11 +71,8 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
             const sessionTime = Date.now() - userData.joinTime;
             userData.totalTime += sessionTime;
             userData.joinTime = null;
-            console.log(`${newState.member.displayName} の計測を停止。セッション時間: ${Math.floor(sessionTime / 1000)}秒`);
-            
-            // ★ 変更点: 計測が完了した瞬間にデータを保存する
-            saveData();
-            console.log(`データが即時保存されました。`);
+            updateUserTime(userId, sessionTime); // データベースを更新
+            console.log(`${newState.member.displayName} の計測を停止。セッション時間: ${Math.floor(sessionTime / 1000)}秒。データベースを更新しました。`);
         }
     } else if (!wasCountable && isCountable) {
         userData.joinTime = Date.now();
@@ -100,13 +80,13 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     }
 });
 
-// スラッシュコマンドの処理 (変更なし)
 client.on(Events.InteractionCreate, async interaction => {
     if (!interaction.isChatInputCommand() || interaction.commandName !== 'te') return;
-    // ... (前回のコードと同じなので省略) ...
+
     const guild = interaction.guild;
     if (!guild) return;
 
+    // 現在のセッション時間を含めたランキングデータを生成
     const displayData = [];
     for (const [userId, data] of userTimes.entries()) {
         let userTotalTime = data.totalTime;
@@ -138,6 +118,9 @@ client.on(Events.InteractionCreate, async interaction => {
             description += `**${member.displayName}**: ${time}\n`;
         } catch (error) {
             console.error(`メンバーの取得に失敗しました: ${item.userId}`);
+            // メンバーが見つからない場合はIDで表示
+            const time = formatTime(item.totalTime);
+            description += `**${item.userId}**: ${time}\n`;
         }
     }
     embed.setDescription(description);
@@ -146,9 +129,8 @@ client.on(Events.InteractionCreate, async interaction => {
 });
 
 
-// --- 補助関数 --- (変更なし)
+// --- 補助関数 ---
 function updateStatus() {
-    // ... (前回のコードと同じなので省略) ...
     let totalMilliseconds = 0;
     for (const data of userTimes.values()) {
         totalMilliseconds += data.totalTime;
@@ -163,7 +145,6 @@ function updateStatus() {
 }
 
 function formatTime(ms) {
-    // ... (前回のコードと同じなので省略) ...
     if (ms < 1000) return `1秒未満`;
     const totalSeconds = Math.floor(ms / 1000);
     const hours = Math.floor(totalSeconds / 3600);
@@ -171,12 +152,5 @@ function formatTime(ms) {
     const seconds = totalSeconds % 60;
     return `${hours}時間 ${minutes}分 ${seconds}秒`;
 }
-
-// Botが終了する直前にデータを保存する (変更なし)
-process.on('SIGINT', () => {
-    console.log('Botを終了します。データを保存中...');
-    saveData();
-    process.exit();
-});
 
 client.login(process.env.DISCORD_TOKEN);
