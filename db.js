@@ -18,9 +18,15 @@ async function initDB() {
         total_time BIGINT NOT NULL DEFAULT 0
       );
     `);
-    console.log('Database table "user_times" is ready.');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS daily_user_times (
+        user_id TEXT PRIMARY KEY,
+        daily_time BIGINT NOT NULL DEFAULT 0
+      );
+    `);
+    console.log('Database tables "user_times" and "daily_user_times" are ready.');
   } catch (err) {
-    console.error('Error initializing database table:', err);
+    console.error('Error initializing database tables:', err);
   } finally {
     client.release();
   }

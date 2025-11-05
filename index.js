@@ -42,6 +42,20 @@ async function updateUserTime(userId, sessionTime) {
     }
 }
 
+async function updateUserDailyTime(userId, sessionTime) {
+    try {
+        const query = `
+            INSERT INTO daily_user_times (user_id, daily_time)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id)
+            DO UPDATE SET daily_time = daily_user_times.daily_time + $2;
+        `;
+        await pool.query(query, [userId, sessionTime]);
+    } catch (error) {
+        console.error(`ユーザーのデイリー時間の更新中にエラーが発生しました (ユーザーID: ${userId}):`, error);
+    }
+}
+
 async function addTimeToAllUsers(ms) {
     try {
         await pool.query('UPDATE user_times SET total_time = total_time + $1', [ms]);
@@ -54,12 +68,33 @@ async function addTimeToAllUsers(ms) {
     }
 }
 
+async function addDailyTimeToAllUsers(ms) {
+    try {
+        const { rows } = await pool.query('SELECT user_id FROM user_times');
+        const userIds = rows.map(row => row.user_id);
+
+        for (const userId of userIds) {
+            const query = `
+                INSERT INTO daily_user_times (user_id, daily_time)
+                VALUES ($1, $2)
+                ON CONFLICT (user_id)
+                DO UPDATE SET daily_time = daily_user_times.daily_time + $2;
+            `;
+            await pool.query(query, [userId, ms]);
+        }
+        console.log(`全ユーザーのデイリー時間に ${ms}ms を追加しました。`);
+    } catch (error) {
+        console.error('全ユーザーへのデイリー時間追加中にエラーが発生しました:', error);
+    }
+}
+
 client.once(Events.ClientReady, async () => {
     console.log(`ログインしました: ${client.user.tag}`);
     await initDB();
     await loadData();
     setInterval(updateStatus, STATUS_UPDATE_INTERVAL);
     updateStatus();
+    scheduleDailyReport();
 });
 
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
@@ -80,6 +115,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
             userData.totalTime += sessionTime;
             userData.joinTime = null;
             updateUserTime(userId, sessionTime);
+            updateUserDailyTime(userId, sessionTime);
             console.log(`${newState.member.displayName} の計測を停止。セッション時間: ${Math.floor(sessionTime / 1000)}秒。データベースを更新しました。`);
         }
     } else if (!wasCountable && isCountable) {
@@ -107,6 +143,7 @@ client.on(Events.MessageCreate, async message => {
     }
 
     await addTimeToAllUsers(msToAdd);
+    await addDailyTimeToAllUsers(msToAdd);
     await updateStatus();
 
     const hours = Math.floor(msToAdd / (1000 * 60 * 60));
@@ -143,6 +180,68 @@ function parseTime(timeString) {
         return value * 60000;
     }
     return null;
+}
+
+async function sendDailyReport() {
+    try {
+        const { rows } = await pool.query('SELECT user_id, daily_time FROM daily_user_times WHERE daily_time > 0 ORDER BY daily_time DESC');
+        if (rows.length === 0) {
+            console.log('本日の作業記録はありませんでした。');
+            return;
+        }
+
+        const guild = client.guilds.cache.get(process.env.GUILD_ID);
+        if (!guild) {
+            console.error('Guild not found.');
+            return;
+        }
+
+        let reportMessage = '';
+        for (const row of rows) {
+            try {
+                const member = await guild.members.fetch(row.user_id);
+                const totalMilliseconds = parseInt(row.daily_time, 10);
+                const hours = Math.floor(totalMilliseconds / 3600000);
+                const minutes = Math.floor((totalMilliseconds % 3600000) / 60000);
+
+                if (hours > 0 || minutes > 0) {
+                    reportMessage += `${member.displayName}: ${hours}時間${minutes}分\n`;
+                }
+            } catch (error) {
+                console.error(`ユーザー情報の取得中にエラーが発生しました (ID: ${row.user_id}):`, error);
+            }
+        }
+
+        if (reportMessage) {
+            const channel = client.channels.cache.get('1435597819246411888');
+            if (channel) {
+                await channel.send(reportMessage);
+                console.log('デイリーレポートを送信しました。');
+                await pool.query('TRUNCATE TABLE daily_user_times');
+                console.log('デイリーレポートテーブルをクリアしました。');
+            } else {
+                console.error('レポート送信先のチャンネルが見つかりませんでした。');
+            }
+        }
+    } catch (error) {
+        console.error('デイリーレポートの送信中にエラーが発生しました:', error);
+    }
+}
+
+function scheduleDailyReport() {
+    const now = new Date();
+    const tomorrow = new Date();
+    tomorrow.setDate(now.getDate() + 1);
+    tomorrow.setHours(4, 0, 0, 0);
+
+    const msUntil4Am = tomorrow.getTime() - now.getTime();
+
+    setTimeout(() => {
+        sendDailyReport();
+        setInterval(sendDailyReport, 24 * 60 * 60 * 1000);
+    }, msUntil4Am);
+
+    console.log(`次のデイリーレポートは ${Math.floor(msUntil4Am / (1000 * 60 * 60))}時間${Math.floor((msUntil4Am % (1000 * 60 * 60)) / (1000 * 60))}分後です。`);
 }
 
 client.login(process.env.DISCORD_TOKEN);
