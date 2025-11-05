@@ -1,5 +1,5 @@
 // index.js
-const { Client, GatewayIntentBits, Events, ActivityType, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Events, ActivityType, PermissionsBitField } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
@@ -14,6 +14,8 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildVoiceStates,
         GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
     ],
 });
 
@@ -100,53 +102,74 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     }
 });
 
-// スラッシュコマンドの処理 (変更なし)
-client.on(Events.InteractionCreate, async interaction => {
-    if (!interaction.isChatInputCommand() || interaction.commandName !== 'te') return;
-    // ... (前回のコードと同じなので省略) ...
-    const guild = interaction.guild;
-    if (!guild) return;
+// --- メッセージコマンドの処理 ---
+client.on(Events.MessageCreate, async message => {
+    if (message.author.bot || !message.content.startsWith('t!')) return;
 
-    const displayData = [];
-    for (const [userId, data] of userTimes.entries()) {
-        let userTotalTime = data.totalTime;
-        if (data.joinTime) {
-            userTotalTime += Date.now() - data.joinTime;
+    const args = message.content.slice('t!'.length).trim().split(/ +/);
+    const command = args.shift().toLowerCase();
+
+    if (command === 'add') {
+        // 管理者権限をチェック
+        if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+            return message.reply('このコマンドを使用するには管理者権限が必要です。');
         }
-        if (userTotalTime > 0) {
-            displayData.push({ userId, totalTime: userTotalTime });
+
+        const timeString = args.join('');
+        if (!timeString) {
+            return message.reply('時間を指定してください (例: t!add 1h30m)');
         }
-    }
 
-    displayData.sort((a, b) => b.totalTime - a.totalTime);
-
-    if (displayData.length === 0) {
-        await interaction.reply('まだ誰も作業時間を記録していません。');
-        return;
-    }
-
-    const embed = new EmbedBuilder()
-        .setTitle('ユーザー別 作業時間ランキング')
-        .setColor(0x0099FF)
-        .setTimestamp();
-
-    let description = '';
-    for (const item of displayData.slice(0, 25)) {
-        try {
-            const member = await guild.members.fetch(item.userId);
-            const time = formatTime(item.totalTime);
-            description += `**${member.displayName}**: ${time}\n`;
-        } catch (error) {
-            console.error(`メンバーの取得に失敗しました: ${item.userId}`);
+        const millisecondsToAdd = parseTime(timeString);
+        if (millisecondsToAdd === 0) {
+            return message.reply('無効な時間形式です。h(時間)、m(分)、s(秒)を使用してください。');
         }
-    }
-    embed.setDescription(description);
 
-    await interaction.reply({ embeds: [embed] });
+        const MANUAL_ADJUSTMENT_ID = 'manual_adjustment';
+        if (!userTimes.has(MANUAL_ADJUSTMENT_ID)) {
+            userTimes.set(MANUAL_ADJUSTMENT_ID, { totalTime: 0, joinTime: null });
+        }
+        const manualData = userTimes.get(MANUAL_ADJUSTMENT_ID);
+        manualData.totalTime += millisecondsToAdd;
+
+        saveData();
+        updateStatus();
+
+        message.reply('時間を追加しました。');
+    }
 });
 
 
+
 // --- 補助関数 --- (変更なし)
+
+function parseTime(timeString) {
+    let totalMilliseconds = 0;
+    const regex = /(\d+)([hms])/g;
+    let match;
+
+    if (!/^\d+[hms]/.test(timeString)) return 0;
+
+    while ((match = regex.exec(timeString)) !== null) {
+        const value = parseInt(match[1]);
+        const unit = match[2];
+
+        switch (unit) {
+            case 'h':
+                totalMilliseconds += value * 60 * 60 * 1000;
+                break;
+            case 'm':
+                totalMilliseconds += value * 60 * 1000;
+                break;
+            case 's':
+                totalMilliseconds += value * 1000;
+                break;
+        }
+    }
+
+    return totalMilliseconds;
+}
+
 function updateStatus() {
     // ... (前回のコードと同じなので省略) ...
     let totalMilliseconds = 0;
